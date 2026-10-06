@@ -48,6 +48,24 @@ the total socket count.
 | **Diagnostics** | Per-port health, peak rates, malformed-data counts, MIDI clock tempo estimation, and an honest list of what the app cannot do. |
 | **Named ports & rigs** | Call socket 7 "Prophet 6". Save the whole patch as a JSON rig, export it, hand it to another machine. |
 | **Panic** | All-notes-off, all-sound-off and sustain-off across every output port. ⌘. |
+| **Runs in the background** | Closing the window does not stop routing — the app keeps running with a menu bar item. ⌘Q quits properly. |
+| **Launch at login** | Optional, so routing returns automatically after a reboot. |
+
+## Why it can keep running in the background
+
+These interfaces have **no routing of their own while a computer is connected** — the
+computer does it. That makes this app the router: if it stops, every route stops with
+it, and a window being closed is not a reason to tear the rig down.
+
+Both settings live in **Preferences** (⌘,) and default to the useful state:
+
+- **Keep routing when the window is closed** — on by default. The app stays alive with
+  a menu bar item; ⌘Q still quits fully.
+- **Start automatically when I log in** — off by default, one click to enable.
+
+If genuinely computer-free standalone routing is what you need, that is a hardware
+feature these units do not have. See
+[FIRMWARE-INVESTIGATION.md](FIRMWARE-INVESTIGATION.md) for why, with measurements.
 
 ## What it deliberately cannot do
 
