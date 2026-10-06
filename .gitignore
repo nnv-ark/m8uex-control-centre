@@ -1,0 +1,21 @@
+# Build products
+.build/
+.build-cache/
+DerivedData/
+
+# The Xcode project is generated from project.yml by XcodeGen
+M8UeXControlCentre.xcodeproj/
+
+# macOS / editor noise
+.DS_Store
+xcuserdata/
+*.xcuserdatad
+.swiftpm/
+
+# Teardown photographs and crops (large; findings live in FIRMWARE-INVESTIGATION.md)
+*.HEIC
+board/
+tile_*.png
+board.png
+menubar.png
+.ui-audit/
