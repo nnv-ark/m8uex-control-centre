@@ -97,6 +97,7 @@ enum SelfTest {
         testTransforms(harness)
         testMultiUnitIdentity(harness)
         testClockTempo(harness)
+        testOfflineDevicesExcluded(harness)
         testProfilePersistence(harness)
         testLiveCoreMIDI(harness)
 
@@ -290,6 +291,57 @@ enum SelfTest {
 
         harness.check("identity transform reports no summary", RouteTransform.identity.summary == nil)
         harness.check("a real transform reports a summary", RouteTransform(transpose: 3).summary != nil)
+    }
+
+    // MARK: Offline devices
+
+    /// CoreMIDI keeps a cached device entry for every interface it has ever seen and
+    /// reports it offline. Those must never be presented as connected, or the app
+    /// claims hardware that is not plugged in — which it did, showing a disconnected
+    /// M4U eX alongside a connected M8U eX.
+    private static func testOfflineDevicesExcluded(_ harness: Harness) {
+        harness.section("Offline devices are not presented as connected")
+
+        // The distinction macOS draws, and which the app must respect.
+        let all = MIDIEndpointEnumerator.m8uPorts()
+        let offline = all.filter { port in
+            (port.source?.offline ?? true) && (port.destination?.offline ?? true)
+        }
+        harness.check("no enumerated socket has both endpoints offline",
+                      offline.isEmpty,
+                      detail: "\(offline.count) offline socket(s) leaked into the port list")
+
+        // Count against what CoreMIDI itself says is online, so this cannot pass by
+        // the port list simply being empty.
+        var onlineSockets = 0
+        for deviceIndex in 0..<MIDIGetNumberOfDevices() {
+            let device = MIDIGetDevice(deviceIndex)
+            let name = MIDIObject.name(device)
+            guard M8UeXDiscovery.matches(deviceName: name) else { continue }
+            if MIDIObject.isOffline(device) { continue }
+            for entityIndex in 0..<MIDIDeviceGetNumberOfEntities(device) {
+                let entity = MIDIDeviceGetEntity(device, entityIndex)
+                if M8UeXDiscovery.portIndex(fromEntityName: MIDIObject.name(entity)) != nil {
+                    onlineSockets += 1
+                }
+            }
+        }
+        harness.check("enumerated socket count matches the online devices",
+                      all.count == onlineSockets,
+                      detail: "enumerated \(all.count), online \(onlineSockets)")
+
+        // Every returned port must have at least one live endpoint.
+        let allLive = all.allSatisfy { port in
+            !(port.source?.offline ?? true) || !(port.destination?.offline ?? true)
+        }
+        harness.check("every returned socket has a live endpoint", allLive)
+
+        // External endpoints are filtered by the same rule.
+        let externals = MIDIEndpointEnumerator.otherPorts(excluding: [])
+        let offlineExternals = externals.filter { $0.source?.offline ?? $0.destination?.offline ?? true }
+        harness.check("no offline external endpoints are offered as routable",
+                      offlineExternals.isEmpty,
+                      detail: "\(offlineExternals.count) offline endpoint(s) leaked in")
     }
 
     // MARK: Clock and tempo

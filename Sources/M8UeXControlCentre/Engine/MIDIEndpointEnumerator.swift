@@ -168,10 +168,17 @@ public enum MIDIEndpointEnumerator {
             guard M8UeXDiscovery.matches(deviceName: deviceName) else { continue }
             let deviceUID = MIDIObject.uniqueID(device) ?? 0
 
+            // CoreMIDI keeps a cached entry for every device it has ever seen, and
+            // reports it as an offline device with offline endpoints. Presenting
+            // those as connected is wrong: the interface is not plugged in, and its
+            // sockets do not exist. Only genuinely online units are enumerated.
+            let deviceOffline = MIDIObject.isOffline(device)
+
             let entityCount = MIDIDeviceGetNumberOfEntities(device)
             for entityIndex in 0..<entityCount {
                 let entity = MIDIDeviceGetEntity(device, entityIndex)
                 let entityName = MIDIObject.name(entity)
+                if deviceOffline { continue }
 
                 // Prefer the number in the entity name, since that is the socket
                 // printed on the hardware. If a firmware revision ever reports
@@ -187,6 +194,12 @@ public enum MIDIEndpointEnumerator {
                 if MIDIEntityGetNumberOfDestinations(entity) > 0 {
                     destination = info(for: MIDIEntityGetDestination(entity, 0), isSource: false)
                 }
+
+                // A socket only counts as present if at least one of its endpoints
+                // is online. Belt and braces on top of the device check above, so a
+                // partially-offline unit cannot contribute phantom sockets.
+                let socketOnline = !(source?.offline ?? true) || !(destination?.offline ?? true)
+                if !socketOnline { continue }
 
                 ports.append(
                     MIDIPort(
@@ -214,8 +227,15 @@ public enum MIDIEndpointEnumerator {
 
         // Pair up sources and destinations that belong to the same entity so one
         // row can act as both an input and an output where applicable.
-        let sources = allSources().filter { $0.kind != .m8uPhysical && !uniqueIDs.contains($0.uniqueID) }
-        let destinations = allDestinations().filter { $0.kind != .m8uPhysical && !uniqueIDs.contains($0.uniqueID) }
+        // Offline endpoints are filtered out for the same reason as offline units:
+        // they are remembered, not connected. They are still resolvable by name if a
+        // saved route references one, which is handled by `PortResolver`.
+        let sources = allSources().filter {
+            $0.kind != .m8uPhysical && !$0.offline && !uniqueIDs.contains($0.uniqueID)
+        }
+        let destinations = allDestinations().filter {
+            $0.kind != .m8uPhysical && !$0.offline && !uniqueIDs.contains($0.uniqueID)
+        }
 
         for source in sources where !seen.contains(source.uniqueID) {
             // Try to find the matching destination on the same device+entity.
