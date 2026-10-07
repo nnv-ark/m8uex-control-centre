@@ -243,6 +243,24 @@ public final class MIDIEngine: ObservableObject {
     @Published public private(set) var totalDropped: UInt64 = 0
     /// Timestamp of the most recent message on any port.
     @Published public private(set) var lastActivityAt: UInt64 = 0
+    /// Average tempo over the last 2 s, derived from MIDI clock. Nil when no clock
+    /// is running, so the UI can distinguish "stopped" from a real 0 BPM.
+    @Published public private(set) var averageBPM: Double?
+    /// Clock pulses currently inside the averaging window.
+    @Published public private(set) var clockPulseCount: Int = 0
+    /// True while clock is arriving.
+    @Published public private(set) var clockIsRunning: Bool = false
+
+    /// Tempo is measured here rather than in the view, so the average is computed
+    /// from CoreMIDI's sample-accurate timestamps instead of from UI refresh timing.
+    public let clockMonitor = ClockMonitor(window: 2.0)
+
+    /// The socket the tempo readout listens to.
+    ///
+    /// Port 1 by convention: on both interfaces socket 1 is the designated input in
+    /// the hardware's thru and merge modes, and it is where a master keyboard or
+    /// sequencer is normally patched. Change it with `setTempoSource(socket:unit:)`.
+    public private(set) var tempoSourcePortID: MIDIPort.ID?
     /// Human-readable status of the CoreMIDI client.
     @Published public private(set) var statusLine: String = "Starting…"
     /// Non-fatal problems worth surfacing to the user.
@@ -510,6 +528,7 @@ public final class MIDIEngine: ObservableObject {
             }
             self.ports = finalPorts
             self.externalPorts = finalExternals
+            self.resolveTempoSource()
             // Remember the friendly name of every external endpoint so a route to
             // one can be re-matched by name after a replug.
             for port in finalPorts where !port.isM8UPhysical {
@@ -712,6 +731,11 @@ public final class MIDIEngine: ObservableObject {
         var outputSink: [MIDIPort.ID: [MIDIMessage]] = [:]
 
         for message in produced {
+            // Tempo is taken from the raw stream, before any route filtering, so a
+            // clock the user has chosen not to forward still drives the display.
+            if message.status == 0xF8 {
+                clockMonitor.record(at: message.timestamp, portID: sourcePortID)
+            }
             runtime.stats.record(message)
             runtime.meter.add(1, at: now)
             // The front panel lights green for input. Observed input traffic is
@@ -916,6 +940,7 @@ public final class MIDIEngine: ObservableObject {
     public func resetStatistics() {
         workQueue.async { [weak self] in
             guard let self else { return }
+            self.clockMonitor.reset()
             for (_, runtime) in self.runtimes {
                 runtime.stats = PortStats()
                 runtime.meter.reset()
@@ -949,6 +974,9 @@ public final class MIDIEngine: ObservableObject {
 
     private func publishSnapshot() {
         let now = MIDITime.hostTime()
+        let bpm = clockMonitor.averageBPM(now: now)
+        let pulses = clockMonitor.pulseCount(now: now)
+        let running = clockMonitor.isRunning(now: now)
         var stats: [MIDIPort.ID: PortStats] = [:]
         var levels: [MIDIPort.ID: Double] = [:]
         var peaks: [MIDIPort.ID: Double] = [:]
@@ -985,6 +1013,9 @@ public final class MIDIEngine: ObservableObject {
             self.portStats = liveStats
             self.portLevels = liveLevels
             self.portPeaks = livePeaks
+            self.averageBPM = bpm
+            self.clockPulseCount = pulses
+            self.clockIsRunning = running
             // Reflect observed directions back onto the published ports.
             if !liveDirections.isEmpty {
                 self.ports = self.ports.map { port in
@@ -1018,6 +1049,42 @@ public final class MIDIEngine: ObservableObject {
 
     public func port(withID id: MIDIPort.ID) -> MIDIPort? {
         ports.first { $0.id == id }
+    }
+
+    /// Points the tempo readout at a socket, or at no single socket.
+    public func setTempoSource(socket: Int?, unitNameFragment: String = "M8U") {
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            if let socket,
+               let port = self.runtimes.values.first(where: { runtime in
+                   runtime.port.m8uIndex == socket
+                       && (runtime.port.unitName?.contains(unitNameFragment) ?? false)
+               }) {
+                self.clockMonitor.preferredPortID = port.portID
+                self.tempoSourcePortID = port.portID
+            } else {
+                self.clockMonitor.preferredPortID = nil
+                self.tempoSourcePortID = nil
+            }
+        }
+    }
+
+    /// Re-points the tempo source at the live port after the graph is rebuilt, since
+    /// a rescan can hand the interface a new unique ID.
+    private func resolveTempoSource() {
+        guard let wanted = tempoSourcePortID ?? defaultTempoSourceID() else { return }
+        let live = resolver.resolve(wanted) ?? wanted
+        if runtimes[live] != nil {
+            clockMonitor.preferredPortID = live
+            tempoSourcePortID = live
+        }
+    }
+
+    /// Socket 1 of the M8U eX, falling back to any interface's socket 1.
+    private func defaultTempoSourceID() -> MIDIPort.ID? {
+        let candidates = runtimes.values.map(\.port)
+        let socketOne = candidates.filter { $0.m8uIndex == 1 }
+        return (socketOne.first { $0.unitName?.contains("M8U") ?? false } ?? socketOne.first)?.id
     }
 
     /// The M8U ports only, in socket order.

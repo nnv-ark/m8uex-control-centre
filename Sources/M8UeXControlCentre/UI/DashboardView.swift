@@ -91,7 +91,29 @@ public struct DashboardView: View {
                     }
                 }
 
-                activitySummary
+                // Bottom row. Three columns, with tempo on the right so it sits
+                // clear of the port grids and can be read at a glance.
+                HStack(alignment: .top, spacing: 16) {
+                    activitySummary
+                        .frame(maxWidth: .infinity)
+                    clockSummary
+                        .frame(maxWidth: .infinity)
+                    Panel {
+                        TempoDisplay(
+                            bpm: engine.averageBPM,
+                            pulseCount: engine.clockPulseCount,
+                            isRunning: engine.clockIsRunning,
+                            window: 2.0,
+                            sourceName: tempoSourceName
+                        )
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+
+                HStack {
+                    Spacer()
+                    tempoSourcePicker
+                }
 
                 if state.showsExternalEndpoints, !otherPorts.isEmpty {
                     Panel(
@@ -270,46 +292,108 @@ public struct DashboardView: View {
                     )
                 }
 
-                if clock > 0 {
-                    TimelineView(.periodic(from: .now, by: 0.25)) { _ in
-                        let rate = engine.portStats.values.reduce(0.0) { $0 + $1.messagesPerSecond }
-                        let bpm = estimatedTempo
-                        HStack(spacing: 6) {
-                            Image(systemName: "metronome")
-                                .mutedText()
-                            Text(bpm.map { "Estimated tempo \(String(format: "%.1f", $0)) BPM from MIDI clock" }
-                                 ?? "MIDI clock present")
-                                .font(.caption)
-                                .mutedText()
-                            Spacer()
-                            Text(Format.rate(rate))
-                                .font(.caption.monospacedDigit())
-                                .mutedText()
-                        }
-                    }
+                // Aggregate throughput only. Tempo has its own column now, and is
+                // measured properly there from clock timestamps rather than inferred
+                // from this port-mixed rate.
+                HStack(spacing: 6) {
+                    Image(systemName: "gauge.with.dots.needle.67percent")
+                        .faintText()
+                    Text("Throughput across all ports")
+                        .font(.system(size: 10))
+                        .mutedText()
+                    Spacer()
+                    Text(Format.rate(engine.portStats.values.reduce(0.0) { $0 + $1.messagesPerSecond }))
+                        .font(.system(size: 11, design: .rounded))
+                        .monospacedDigit()
+                        .mutedText()
                 }
             }
         }
     }
 
-    /// MIDI clock runs at 24 pulses per quarter note, so 24 clock messages per
-    /// second equals 60 BPM. Derived from the observed clock rate.
-    private var estimatedTempo: Double? {
-        // Clock messages arrive at a steady 24 ppqn, so rather than trusting the
-        // aggregate (which note traffic inflates) we look at the busiest clock port.
-        let clockRates = engine.ports.compactMap { port -> Double? in
-            guard let stats = engine.portStats[port.id], stats.clockCount > 0 else { return nil }
-            return stats.messagesPerSecond
+    /// Label for the socket the tempo is measured from.
+    private var tempoSourceName: String {
+        guard let id = engine.tempoSourcePortID else { return "busiest socket" }
+        return state.compactLabel(for: id)
+    }
+
+    /// Sockets offered as the tempo source: inputs on either interface.
+    private var tempoSourceChoices: [(id: MIDIPort.ID, label: String)] {
+        engine.ports
+            .filter { $0.isM8UPhysical && $0.source != nil }
+            .sorted { $0.sortKey < $1.sortKey }
+            .map { (id: $0.id, label: state.label(for: $0.id)) }
+    }
+
+    /// Lets the tempo be measured from one nominated socket instead of the busiest.
+    ///
+    /// Necessary in practice rather than a nicety: a DAW that takes clock on one
+    /// input and broadcasts its own to every output will, through the interface's
+    /// own routing, appear on several ports at once — and a merged reading is
+    /// inflated by the number of ports.
+    private var tempoSourcePicker: some View {
+        Menu {
+            Button("Busiest socket") { engine.setTempoSource(socket: nil) }
+            Divider()
+            ForEach(tempoSourceChoices, id: \.id) { choice in
+                Button(choice.label) {
+                    if let socket = choice.id.socketIndex {
+                        engine.setTempoSource(socket: socket)
+                    }
+                }
+            }
+        } label: {
+            Label("Clock source", systemImage: "metronome")
+                .font(.system(size: 10))
         }
-        guard let busiest = clockRates.max(), busiest > 1 else { return nil }
-        // messagesPerSecond counts every message kind, so scale by the clock share
-        // of that port's traffic to avoid reporting nonsense on a busy port.
-        let portClockShare = engine.ports.compactMap { port -> Double? in
-            guard let stats = engine.portStats[port.id], stats.messageCount > 0, stats.clockCount > 0 else { return nil }
-            let share = Double(stats.clockCount) / Double(stats.messageCount)
-            return stats.messagesPerSecond * share
-        }.max() ?? busiest
-        return portClockShare / 24.0 * 60.0
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    // MARK: Clock
+
+    /// Per-port clock totals, so the averaged tempo can be traced to a source.
+    private var clockSummary: some View {
+        let clockPorts = engine.ports.compactMap { port -> (MIDIPort, PortStats)? in
+            guard let stats = engine.portStats[port.id], stats.clockCount > 0 else { return nil }
+            return (port, stats)
+        }
+        .sorted { $0.1.clockCount > $1.1.clockCount }
+
+        return Panel(
+            title: "MIDI clock",
+            subtitle: clockPorts.isEmpty ? "no clock seen yet" : "24 pulses per quarter note"
+        ) {
+            VStack(alignment: .leading, spacing: 6) {
+                if clockPorts.isEmpty {
+                    Text("Start your sequencer to send clock.")
+                        .font(.system(size: 11))
+                        .mutedText()
+                } else {
+                    ForEach(clockPorts.prefix(5), id: \.0.id) { port, stats in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(Palette.color(for: port.direction))
+                                .frame(width: 7, height: 7)
+                            Text(state.compactLabel(for: port.id))
+                                .font(.system(size: 11))
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            Text(Format.count(stats.clockCount))
+                                .font(.system(size: 11, design: .rounded))
+                                .monospacedDigit()
+                                .mutedText()
+                        }
+                    }
+                    if clockPorts.count > 5 {
+                        Text("and \(clockPorts.count - 5) more…")
+                            .font(.system(size: 10))
+                            .faintText()
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 

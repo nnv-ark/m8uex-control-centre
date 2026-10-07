@@ -96,6 +96,7 @@ enum SelfTest {
         testFiltering(harness)
         testTransforms(harness)
         testMultiUnitIdentity(harness)
+        testClockTempo(harness)
         testProfilePersistence(harness)
         testLiveCoreMIDI(harness)
 
@@ -289,6 +290,126 @@ enum SelfTest {
 
         harness.check("identity transform reports no summary", RouteTransform.identity.summary == nil)
         harness.check("a real transform reports a summary", RouteTransform(transpose: 3).summary != nil)
+    }
+
+    // MARK: Clock and tempo
+
+    /// Tempo is derived from MIDI clock pulse timestamps, 24 pulses per quarter
+    /// note. A wrong number here would be actively misleading, so the maths is
+    /// pinned: a known pulse rate must produce a known BPM, and silence must
+    /// produce no reading at all rather than zero.
+    private static func testClockTempo(_ harness: Harness) {
+        harness.section("Clock and tempo")
+
+        // 24 pulses per second = 60 BPM, the definition of MIDI clock.
+        harness.check("24 pulses per quarter note",
+                      ClockMonitor.pulsesPerQuarterNote == 24)
+
+        let monitor = ClockMonitor(window: 2.0)
+        let start = MIDITime.hostTime()
+        let portID = MIDIPort.ID.m8u(unitName: "ESI M8U eX", deviceUID: 1, index: 1)
+
+        // Feed 24 pulses at exactly 1/24 s spacing => 60 BPM.
+        let interval = MIDITime.hostTicks(seconds: 1.0 / 24.0)
+        for i in 0..<48 {
+            monitor.record(at: start &+ UInt64(i) * interval, portID: portID)
+        }
+        let atEnd = start &+ UInt64(47) * interval
+        let bpm60 = monitor.averageBPM(now: atEnd)
+        harness.check("72 pulses at 1/24 s spacing reads 60 BPM",
+                      bpm60.map { abs($0 - 60) < 2 } ?? false,
+                      detail: "got \(bpm60.map { String(format: "%.2f", $0) } ?? "nil")")
+
+        // Double the rate => 120 BPM.
+        let fast = ClockMonitor(window: 2.0)
+        let fastInterval = MIDITime.hostTicks(seconds: 1.0 / 48.0)
+        for i in 0..<96 {
+            fast.record(at: start &+ UInt64(i) * fastInterval, portID: portID)
+        }
+        let fastEnd = start &+ UInt64(95) * fastInterval
+        let bpm120 = fast.averageBPM(now: fastEnd)
+        harness.check("96 pulses at 1/48 s spacing reads 120 BPM",
+                      bpm120.map { abs($0 - 120) < 3 } ?? false,
+                      detail: "got \(bpm120.map { String(format: "%.2f", $0) } ?? "nil")")
+
+        // No clock at all must be nil, not zero — "stopped" is not "0 BPM".
+        let silent = ClockMonitor(window: 2.0)
+        harness.check("silence reports no tempo rather than zero",
+                      silent.averageBPM(now: start) == nil)
+        harness.check("silence is not reported as running",
+                      silent.isRunning(now: start) == false)
+
+        // One pulse is not enough to measure a rate.
+        let single = ClockMonitor(window: 2.0)
+        single.record(at: start, portID: portID)
+        harness.check("a single pulse yields no tempo",
+                      single.averageBPM(now: start) == nil)
+
+        // Clock that stopped a while ago must not keep reporting an old tempo.
+        let stalled = ClockMonitor(window: 2.0)
+        for i in 0..<48 {
+            stalled.record(at: start &+ UInt64(i) * interval, portID: portID)
+        }
+        let longAfter = atEnd &+ MIDITime.hostTicks(seconds: 5)
+        harness.check("a stalled clock stops reporting tempo",
+                      stalled.averageBPM(now: longAfter) == nil,
+                      detail: "got \(stalled.averageBPM(now: longAfter).map { String(format: "%.2f", $0) } ?? "nil")")
+        harness.check("a stalled clock is not reported as running",
+                      stalled.isRunning(now: longAfter) == false)
+
+        // The bug this guards against was real and shipped for one build: a DAW
+        // broadcasts clock to every output, and merging all ports into one pulse
+        // list reported N x the true tempo (measured: 317 BPM for a 60 BPM source
+        // across five ports). Tempo must be taken per port.
+        let shared = ClockMonitor(window: 2.0)
+        let ports = (1...5).map { MIDIPort.ID.m8u(unitName: "ESI M8U eX", deviceUID: 1, index: $0) }
+        for i in 0..<48 {
+            // The same clock pulse arriving on five ports at the same instant.
+            for port in ports {
+                shared.record(at: start &+ UInt64(i) * interval, portID: port)
+            }
+        }
+        let sharedBPM = shared.averageBPM(now: atEnd)
+        harness.check("clock broadcast to 5 ports still reads 60 BPM, not 5x",
+                      sharedBPM.map { abs($0 - 60) < 2 } ?? false,
+                      detail: "got \(sharedBPM.map { String(format: "%.2f", $0) } ?? "nil")")
+        harness.check("pulse count reflects one port, not the sum",
+                      shared.pulseCount(now: atEnd) <= 49,
+                      detail: "counted \(shared.pulseCount(now: atEnd))")
+        harness.check("all five clock ports are reported",
+                      shared.activeClockPorts(now: atEnd).count == 5,
+                      detail: "saw \(shared.activeClockPorts(now: atEnd).count)")
+        harness.check("a single port's tempo can be read individually",
+                      shared.bpm(forPort: ports[0], now: atEnd).map { abs($0 - 60) < 2 } ?? false)
+
+        // Two ports at genuinely different tempos must not be blended.
+        let mixed = ClockMonitor(window: 2.0)
+        for i in 0..<24 { mixed.record(at: start &+ UInt64(i) * interval, portID: ports[0]) }
+        for i in 0..<48 { mixed.record(at: start &+ UInt64(i) * fastInterval, portID: ports[1]) }
+        let dominant = mixed.averageBPM(now: atEnd)
+        harness.check("the busier port wins rather than the two being blended",
+                      dominant.map { abs($0 - 120) < 4 } ?? false,
+                      detail: "got \(dominant.map { String(format: "%.2f", $0) } ?? "nil")")
+
+        // The window must actually bound how much history is kept.
+        harness.check("pulses are pruned to the 2 s window",
+                      monitor.pulseCount(now: atEnd) <= 49,
+                      detail: "kept \(monitor.pulseCount(now: atEnd))")
+
+        // A gap larger than the window discards stale history rather than
+        // averaging across the silence.
+        let restarted = ClockMonitor(window: 2.0)
+        for i in 0..<24 {
+            restarted.record(at: start &+ UInt64(i) * interval, portID: portID)
+        }
+        let resumed = atEnd &+ MIDITime.hostTicks(seconds: 10)
+        for i in 0..<24 {
+            restarted.record(at: resumed &+ UInt64(i) * interval, portID: portID)
+        }
+        let afterGap = restarted.averageBPM(now: resumed &+ UInt64(23) * interval)
+        harness.check("a long gap is not averaged across",
+                      afterGap.map { abs($0 - 60) < 3 } ?? false,
+                      detail: "got \(afterGap.map { String(format: "%.2f", $0) } ?? "nil")")
     }
 
     // MARK: Multi-unit identity
